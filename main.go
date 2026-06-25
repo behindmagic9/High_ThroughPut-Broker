@@ -15,8 +15,7 @@ import (
 func PrintMetrics(metrics *deliverystatus.Metrics) {
 	fmt.Printf("Published %d \n", metrics.Published.Load())
 	fmt.Printf("Delivered %d \n", metrics.Delivered.Load())
-	fmt.Printf("DeadLetter %d \n", metrics.DeadLetter.Load())
-	fmt.Printf("Retried %d \n", metrics.Retried.Load())
+	fmt.Printf("Failed %d \n", metrics.Failed.Load())
 	fmt.Printf("Dropped %d \n", metrics.Dropped.Load())
 }
 
