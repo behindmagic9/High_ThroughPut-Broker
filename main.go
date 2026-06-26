@@ -9,6 +9,7 @@ import (
 	"observer/publisher"
 	"observer/subscriber"
 	"sync"
+	"runtime"
 	"time"
 )
 
@@ -26,7 +27,14 @@ func main() {
 	sub1 := subscriber.NewSub("sub1")
 	sub2 := subscriber.NewSub("sub2")
 
-	brkr, err := broker.NewBroker()
+	// Configure Broker
+	brkr, err := broker.NewBroker(
+		10000, // queue size
+		1, // worker per thread
+		runtime.NumCPU(), // Queue Count
+		runtime.NumCPU(), // Shard Count
+		32 // BATCH SIZE
+	)
 	if err != nil {
 		log.Fatal(err)
 		return
@@ -56,12 +64,12 @@ func main() {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100000; i++ {
-			publisher1.Publish(event.NewEvent("BTC", "the brid fled", 21))
-			publisher2.Publish(event.NewEvent("ETH", "the animal run ", 23))
-			publisher2.Publish(event.NewEvent("ADA", "the animal run ", 23))
-			publisher2.Publish(event.NewEvent("XRP", "the animal run ", 23))
-			publisher2.Publish(event.NewEvent("BNB", "the animal run ", 23))
-			publisher2.Publish(event.NewEvent("SOL", "the animal run ", 23))
+			publisher1.Publish(event.NewEvent("BTC", "UP", 21))
+			publisher2.Publish(event.NewEvent("ETH", "UP", 23))
+			publisher2.Publish(event.NewEvent("ADA", "DOWN", 23))
+			publisher2.Publish(event.NewEvent("XRP", "DOWN ", 23))
+			publisher2.Publish(event.NewEvent("BNB", "DOWN", 23))
+			publisher2.Publish(event.NewEvent("SOL", "UP", 23))
 		}
 	}()
 

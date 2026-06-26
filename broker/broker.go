@@ -2,22 +2,26 @@ package broker
 
 import (
 	"context"
-	"hash/fnv"
+	//"hash/fnv"
 	"observer/deliverystatus"
 	"observer/event"
 	"observer/isubscriber"
+	//"runtime"
 	"sync"
-	"runtime"
 	"sync/atomic"
 )
 
+type SubcriberMap map[string][]isubscriber.Isubscriber
+
+type Shard struct {
+	queue       chan *deliverystatus.DeliveryTracker
+	subscribers atomic.Pointer[SubcriberMap]
+}
+
 type Broker struct {
-	record          map[string][]isubscriber.Isubscriber
-	queues          []chan *deliverystatus.DeliveryTracker
-	//	bufferQueue chan *event.Event
-	metrics     deliverystatus.Metrics
+	shards      []Shard
+	Metrics     deliverystatus.Metrics
 	closed      atomic.Bool
-	mu          sync.RWMutex
 	wg          sync.WaitGroup
 	closeOnce   sync.Once
 	startOnce   sync.Once
@@ -30,28 +34,39 @@ type Broker struct {
 
 // var is not used inside the struct
 
-const MAX_RETRY int = 5
-const MAX_QUEUE_SIZE = 10000
-const MAX_BUFFER_SIZE = 2000
+var MAX_RETRY int
+var MAX_QUEUE_SIZE int
 
-var WORKERS_PER_THREAD = runtime.NumCPU()
+var WORKERS_PER_THREAD int
 
-var QUEUE_COUNT = runtime.NumCPU()
+var QUEUE_COUNT int
 
-const BATCH_SIZE = 32
+var SHARD_COUNT int
 
-func NewBroker() (*Broker, error) {
-	ques := make([]chan *deliverystatus.DeliveryTracker, QUEUE_COUNT)
-	for i := 0; i < QUEUE_COUNT; i++ {
-		ques[i] = make(chan *deliverystatus.DeliveryTracker, MAX_QUEUE_SIZE)
+var BATCH_SIZE int
+
+func NewBroker(maxqueuesize int,workerperthread int,queuecount int,shardcount int, batchsize int) (*Broker, error) {
+	MAX_QUEUE_SIZE = maxqueuesize
+	WORKERS_PER_THREAD = workerperthread
+	QUEUE_COUNT = queuecount
+	SHARD_COUNT = shardcount
+	BATCH_SIZE = batchsize
+	shrds := make([]Shard, SHARD_COUNT)
+	for i := 0; i < SHARD_COUNT; i++ {
+		m := make(SubcriberMap)
+		var p atomic.Pointer[SubcriberMap]
+		p.Store(&m)
+		shrds[i] = Shard{
+			queue:       make(chan *deliverystatus.DeliveryTracker, MAX_QUEUE_SIZE),
+			subscribers: p,
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Broker{
-		record:          make(map[string][]isubscriber.Isubscriber),
-		queues:          ques,
-		closed:          atomic.Bool{},
-		ctx:             ctx,
-		cancel:          cancel,
+		shards: shrds,
+		closed: atomic.Bool{},
+		ctx:    ctx,
+		cancel: cancel,
 		trackerPool: sync.Pool{
 			New: func() interface{} {
 				return &deliverystatus.DeliveryTracker{}
@@ -61,9 +76,15 @@ func NewBroker() (*Broker, error) {
 }
 
 func (s *Broker) Subscribe(topic string, obs isubscriber.Isubscriber) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.record[topic] = append(s.record[topic], obs)
+	// find the hash and related shard  fmr shareds
+	shrd := &s.shards[s.route(topic)]
+	oldMap := shrd.subscribers.Load()
+	newMap := make(SubcriberMap)
+	for k, v := range *oldMap { // copy from old Map
+		newMap[k] = append([]isubscriber.Isubscriber(nil), v...)
+	}
+	newMap[topic] = append(newMap[topic], obs) // appneding ot new map
+	shrd.subscribers.Store(&newMap)
 }
 
 func (s *Broker) releaseTracker(t *deliverystatus.DeliveryTracker) {
@@ -79,17 +100,25 @@ func (s *Broker) encapsulate(data *event.Event, sb isubscriber.Isubscriber) *del
 	return tk
 }
 
+/*
 func fnvHash(topic string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(topic))
 	return h.Sum32()
 }
+*/
 
 func (s *Broker) route(topic string) int {
 	// retrun the hasjh in int
 	// make that % modulo bound to QUEUE_COUNT (hash % QUEUE_COUNT)
-	h := fnvHash(topic)
-	return int(h % uint32(QUEUE_COUNT))
+	var h uint32 = 2166136261
+	for i := 0; i < len(topic); i++ {
+		h ^= uint32(topic[i])
+		h *= 16777619
+	}
+	return int(h % uint32(SHARD_COUNT))
+	//h := fnvHash(topic)
+	//return int(h % uint32(QUEUE_COUNT))
 }
 
 func (s *Broker) Notify(data *event.Event) {
@@ -100,22 +129,23 @@ func (s *Broker) Notify(data *event.Event) {
 		return
 	}
 
-	s.mu.RLock()
-	subs := append([]isubscriber.Isubscriber(nil), s.record[data.Topic]...)
-	s.mu.RUnlock()
-
-	shrd := s.route(data.Topic)
-
+	topic := data.Topic
+	hashh := s.route(topic)
+	m := s.shards[hashh].subscribers.Load()
+	subs,ok := (*m)[topic]
+	if !ok{
+		return
+	}
 	for _, sub := range subs {
 		tk := s.encapsulate(data, sub)
 		select {
 		case <-s.ctx.Done():
 			s.releaseTracker(tk)
 			return
-		case s.queues[shrd] <- tk:
-			s.metrics.Published.Add(1)
+		case s.shards[hashh].queue <- tk:
+			s.Metrics.Published.Add(1)
 		default:
-			s.metrics.Dropped.Add(1)
+			s.Metrics.Dropped.Add(1)
 			s.releaseTracker(tk)
 		}
 	}
@@ -125,12 +155,11 @@ func (s *Broker) Notify(data *event.Event) {
 func (s *Broker) Start() {
 	// just putting a check to check if cahnnel close then not call start again anyhow by mistake
 	s.startOnce.Do(func() {
-
 		if s.closed.Load() {
 			return
 		}
 
-		for shard := 0; shard < QUEUE_COUNT; shard++ {
+		for shard := 0; shard < SHARD_COUNT; shard++ {
 			for w := 0; w < WORKERS_PER_THREAD; w++ {
 				s.wg.Add(1)
 				go s.ProcessEvents(shard)
@@ -151,11 +180,11 @@ func (s *Broker) ProcessEvents(shard int) {
 	*/
 
 	//batching code
-	queue := s.queues[shard]
+	shad := &s.shards[shard]
 	batch := make([]*deliverystatus.DeliveryTracker, 0, BATCH_SIZE)
 
 	for {
-		first, ok := <-queue
+		first, ok := <-shad.queue
 		if !ok {
 			return // reading from a closed cahnnel will return niull which can cause panic in evalute events
 		}
@@ -163,7 +192,7 @@ func (s *Broker) ProcessEvents(shard int) {
 		draining := true
 		for draining && len(batch) < BATCH_SIZE {
 			select {
-			case ev, ok := <-queue:
+			case ev, ok := <-shad.queue:
 				if !ok {
 					draining = false
 					continue
@@ -174,13 +203,12 @@ func (s *Broker) ProcessEvents(shard int) {
 			}
 		}
 
-		for i := 0; i < len(batch); i++ {
+		for i := range batch {
 			s.evaluateEvents(batch[i])
 		}
 
 		batch = batch[:0]
 	}
-
 }
 
 // without adding the recieveer param will act like independent function not like memeber function of Broker
@@ -188,36 +216,42 @@ func (s *Broker) evaluateEvents(first *deliverystatus.DeliveryTracker) {
 	first.Status = deliverystatus.Processing
 	err := first.Subscriber.Update(first.Event) // as the Update gonna return the err
 	if err != nil {
-		s.metrics.Failed.Add(1) // increment faied here
+		s.Metrics.Failed.Add(1) // increment faied here
 		first.Status = deliverystatus.Failed
 		s.releaseTracker(first)
 		return
 	}
 	first.Status = deliverystatus.Delivered
-	s.metrics.Delivered.Add(1) // increment delivered here
+	s.Metrics.Delivered.Add(1) // increment delivered here
 	s.releaseTracker(first)
 }
 
 func (s *Broker) Unsubscribe(topic string, subb isubscriber.Isubscriber) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	subscribers := s.record[topic]
-	for i, sb := range subscribers {
+	hashh := s.route(topic)
+	shard := &s.shards[hashh]
+	oldMap := shard.subscribers.Load()
+	newMap := make(SubcriberMap)
+	for k, v := range *oldMap {
+		newMap[k] = append([]isubscriber.Isubscriber(nil), v...)
+	}
+	subs := newMap[topic]
+	for i, sb := range subs {
 		if sb.GetID() == subb.GetID() {
-			s.record[topic] = append(subscribers[:i], subscribers[i+1:]...)
+			newMap[topic] = append(subs[:i], subs[i+1:]...)
 			// appening/joining.. the observers underlying array froms start to previous elment of i and then next element of i to last
 			break
 		}
 	}
+	shard.subscribers.Store(&newMap)
 }
 
 func (s *Broker) GetMetrics() *deliverystatus.Metrics {
-	return &s.metrics
+	return &s.Metrics
 }
 
 func (s *Broker) closeChannel() {
-	for i := 0; i < QUEUE_COUNT; i++ {
-		close(s.queues[i])
+	for i := 0; i < SHARD_COUNT; i++ {
+		close(s.shards[i].queue)
 	}
 }
 
@@ -227,10 +261,8 @@ func (s *Broker) Close() {
 
 		// defer s.mu.Unlock() // can put the defer here cause now the worker will be waiting for the read lock(Rlock) there in evaluate_events and close will wait for workers to Done
 		// instead have to release lock self
-		s.mu.Lock()
 		s.closed.Store(true)
 		s.closeChannel()
-		s.mu.Unlock()
 		// will wait for 	// will wait for the this write and will release the lock now the this write and will release the lock now
 		//  === Rule of this is  -> never hold mutex while calling Wait() ====
 		s.wg.Wait()
