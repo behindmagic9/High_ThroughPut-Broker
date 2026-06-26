@@ -58,3 +58,4 @@ Subscriber.Update()
 * Persistence interface
 * P50 / P95 / P99 latency benchmarks
 * CPU and memory profiling
+* Test and benchmark scripts to fully through test the code adn its latency and througput
