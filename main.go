@@ -28,13 +28,13 @@ func main() {
 	sub2 := subscriber.NewSub("sub2")
 
 	// Configure Broker
-	brkr, err := broker.NewBroker(
+	config := broker.Config{
 		10000, // queue size
 		1, // worker per thread
-		runtime.NumCPU(), // Queue Count
 		runtime.NumCPU(), // Shard Count
-		32 // BATCH SIZE
-	)
+		32 // BATCH SIZE	
+	}
+	brkr, err := broker.NewBroker(&config)
 	if err != nil {
 		log.Fatal(err)
 		return
@@ -83,7 +83,3 @@ func main() {
 	rate := float64(metrics.Delivered.Load()) / elapsed.Seconds()
 	fmt.Printf("Rate: %f msg/sec \n", rate)
 }
-
-// just remember to close the channel and when the channel are in blocking and nonblocking cause that can be causing the probelm
-// and confirm before closing channel if any goruotine associated with them is complete can be doneusing waitgroup
-// and use of mutex for locking for read and write end , so that no else can read or write when u are , other alternative for varibale is atomic\

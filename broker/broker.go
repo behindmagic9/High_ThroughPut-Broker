@@ -11,6 +11,15 @@ import (
 	"sync/atomic"
 )
 
+type Config struct{
+	MAX_RETRY int
+	MAX_QUEUE_SIZE int
+	WORKERS_PER_THREAD int
+	//QUEUE_COUNT int
+	SHARD_COUNT int
+	BATCH_SIZE int
+}
+
 type SubcriberMap map[string][]isubscriber.Isubscriber
 
 type Shard struct {
@@ -28,41 +37,31 @@ type Broker struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	trackerPool sync.Pool
+	MAX_QUEUE_SIZE int
+	WORKERS_PER_THREAD int
+	SHARD_COUNT int
+	BATCH_SIZE int
 }
 
 // why we use struct{} cause its j:ust zero memory allocation and can be use to pass the signal only , that we needed right now
 
-// var is not used inside the struct
-
-var MAX_RETRY int
-var MAX_QUEUE_SIZE int
-
-var WORKERS_PER_THREAD int
-
-var QUEUE_COUNT int
-
-var SHARD_COUNT int
-
-var BATCH_SIZE int
-
-func NewBroker(maxqueuesize int,workerperthread int,queuecount int,shardcount int, batchsize int) (*Broker, error) {
-	MAX_QUEUE_SIZE = maxqueuesize
-	WORKERS_PER_THREAD = workerperthread
-	QUEUE_COUNT = queuecount
-	SHARD_COUNT = shardcount
-	BATCH_SIZE = batchsize
-	shrds := make([]Shard, SHARD_COUNT)
-	for i := 0; i < SHARD_COUNT; i++ {
+func NewBroker(config *Config) (*Broker, error) {
+	shrds := make([]Shard, config.SHARD_COUNT)
+	for i := 0; i < config.SHARD_COUNT; i++ {
 		m := make(SubcriberMap)
 		var p atomic.Pointer[SubcriberMap]
 		p.Store(&m)
 		shrds[i] = Shard{
-			queue:       make(chan *deliverystatus.DeliveryTracker, MAX_QUEUE_SIZE),
+			queue: make(chan *deliverystatus.DeliveryTracker, config.MAX_QUEUE_SIZE),
 			subscribers: p,
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Broker{
+		MAX_QUEUE_SIZE: config.MAX_QUEUE_SIZE,
+		WORKERS_PER_THREAD: config.WORKERS_PER_THREAD,
+		SHARD_COUNT: config.SHARD_COUNT,
+		BATCH_SIZE: config.BATCH_SIZE,
 		shards: shrds,
 		closed: atomic.Bool{},
 		ctx:    ctx,
@@ -116,7 +115,7 @@ func (s *Broker) route(topic string) int {
 		h ^= uint32(topic[i])
 		h *= 16777619
 	}
-	return int(h % uint32(SHARD_COUNT))
+	return int(h % uint32(s.SHARD_COUNT))
 	//h := fnvHash(topic)
 	//return int(h % uint32(QUEUE_COUNT))
 }
@@ -159,8 +158,8 @@ func (s *Broker) Start() {
 			return
 		}
 
-		for shard := 0; shard < SHARD_COUNT; shard++ {
-			for w := 0; w < WORKERS_PER_THREAD; w++ {
+		for shard := 0; shard < s.SHARD_COUNT; shard++ {
+			for w := 0; w < s.WORKERS_PER_THREAD; w++ {
 				s.wg.Add(1)
 				go s.ProcessEvents(shard)
 			}
@@ -181,7 +180,7 @@ func (s *Broker) ProcessEvents(shard int) {
 
 	//batching code
 	shad := &s.shards[shard]
-	batch := make([]*deliverystatus.DeliveryTracker, 0, BATCH_SIZE)
+	batch := make([]*deliverystatus.DeliveryTracker, 0, s.BATCH_SIZE)
 
 	for {
 		first, ok := <-shad.queue
@@ -190,7 +189,7 @@ func (s *Broker) ProcessEvents(shard int) {
 		}
 		batch = append(batch, first)
 		draining := true
-		for draining && len(batch) < BATCH_SIZE {
+		for draining && len(batch) < s.BATCH_SIZE {
 			select {
 			case ev, ok := <-shad.queue:
 				if !ok {
@@ -250,21 +249,15 @@ func (s *Broker) GetMetrics() *deliverystatus.Metrics {
 }
 
 func (s *Broker) closeChannel() {
-	for i := 0; i < SHARD_COUNT; i++ {
+	for i := 0; i < s.SHARD_COUNT; i++ {
 		close(s.shards[i].queue)
 	}
 }
 
 func (s *Broker) Close() {
-	// mutex lock so that no two thing can lock it simuntanoeusly
 	s.closeOnce.Do(func() {
-
-		// defer s.mu.Unlock() // can put the defer here cause now the worker will be waiting for the read lock(Rlock) there in evaluate_events and close will wait for workers to Done
-		// instead have to release lock self
 		s.closed.Store(true)
 		s.closeChannel()
-		// will wait for 	// will wait for the this write and will release the lock now the this write and will release the lock now
-		//  === Rule of this is  -> never hold mutex while calling Wait() ====
 		s.wg.Wait()
 		s.cancel()
 	})
